@@ -297,53 +297,6 @@ class CharbonnierLoss1(nn.Module):
         loss = torch.mean((diff * diff) + (self.eps*self.eps))
         return loss
 
-import loss.depth_networks as networks
-
-class depth_loss(nn.Module):
-    def __init__(self):
-        super(depth_loss, self).__init__()
-        self.criterion = nn.L1Loss()
-
-        self.encoder = networks.ResnetEncoder(18, False)
-        encoder_path = '/ghome/zhuyr/UDC_codes/other_methods/ADDS-DepthNet-main/pretrained_model/encoder.pth'
-        loaded_dict_enc = torch.load(encoder_path, map_location=device)
-
-        # extract the height and width of image that this model was trained with
-        self.feed_height = loaded_dict_enc['height']
-        self.feed_width = loaded_dict_enc['width']
-        filtered_dict_enc = {k: v for k, v in loaded_dict_enc.items() if k in self.encoder.state_dict()}
-        self.encoder.load_state_dict(filtered_dict_enc)
-        self.encoder.to(device)
-        self.encoder.eval()
-
-        #print("   Loading pretrained decoder")
-        self.depth_decoder = networks.DepthDecoder(num_ch_enc=self.encoder.num_ch_enc,
-                                                   scales=range(4))
-        depth_decoder_path = '/ghome/zhuyr/UDC_codes/other_methods/ADDS-DepthNet-main/pretrained_model/depth.pth'
-        loaded_dict = torch.load(depth_decoder_path, map_location=device)
-        self.depth_decoder.load_state_dict(loaded_dict)
-        self.depth_decoder.to(device)
-        self.depth_decoder.eval()
-
-    def forward(self, x, y):
-        # print('self.feed_height,self.feed_width',self.feed_height,self.feed_width) #256 512
-        x_in = F.interpolate(x,size=(self.feed_height,self.feed_width),mode='bilinear')
-        # torch.nn.functional.interpolate(input, size=(self.feed_height,self.feed_width), scale_factor=None, mode='bilinear', align_corners=None,
-        #                             recompute_scale_factor=None)
-        y_in = F.interpolate(y,size=(self.feed_height,self.feed_width),mode='bilinear')
-        # torch.nn.functional.interpolate(input, size=(self.feed_height,self.feed_width), scale_factor=None, mode='bilinear', align_corners=None,
-        #                             recompute_scale_factor=None)
-
-        x_out = self.depth_decoder(self.encoder(x_in, 'day', 'val'))
-        y_out = self.depth_decoder(self.encoder(y_in, 'day', 'val'))
-        #print('len x_out:',len(x_out))
-        x_out = x_out[("disp", 0)]
-        y_out = y_out[("disp", 0)]
-
-        return self.criterion(x_out,y_out)
-
-
-
 class EdgeLoss(nn.Module):
     def __init__(self):
         super(EdgeLoss, self).__init__()

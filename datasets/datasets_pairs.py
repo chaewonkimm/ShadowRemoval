@@ -9,23 +9,21 @@ from torch.utils.data import Dataset,DataLoader
 
 
 class my_dataset(Dataset):
-    def __init__(self, rootA_in, rootA_label ,crop_size =256, fix_sample_A = 500, regular_aug =False):
-        super(my_dataset,self).__init__()
-
+    def __init__(self, root_dir, crop_size=256, fix_sample_A=999, regular_aug=False):
+        super(my_dataset, self).__init__()
         self.regular_aug = regular_aug
-        #in_imgs
         self.fix_sample_A = fix_sample_A
 
-        in_files_A = os.listdir(rootA_in)
+        in_files_A = [f for f in os.listdir(root_dir) if '_in' in f]
         if self.fix_sample_A > len(in_files_A):
             self.fix_sample_A = len(in_files_A)
         in_files_A = random.sample(in_files_A, self.fix_sample_A)
-        self.imgs_in_A = [os.path.join(rootA_in, k) for k in in_files_A]
-        self.imgs_gt_A = [os.path.join(rootA_label, k) for k in in_files_A]#gt_imgs
+        self.imgs_in_A = [os.path.join(root_dir, k) for k in in_files_A]
+        self.imgs_gt_A = [os.path.join(root_dir, k.replace('_in', '_gt')) for k in in_files_A]
 
-        len_imgs_in_A = len(self.imgs_in_A)
-        self.length = len_imgs_in_A
+        self.length = len(self.imgs_in_A)
         self.crop_size = crop_size
+        
     def __getitem__(self, index):
         data_IN_A, data_GT_A, img_name_A = self.read_imgs_pair(self.imgs_in_A[index], self.imgs_gt_A[index],
                                                                self.train_transform, self.crop_size)
@@ -265,8 +263,6 @@ class DatasetForInference(Dataset):
 
 import bisect
 import warnings
-
-from torch._utils import _accumulate
 from torch import randperm
 
 
@@ -356,48 +352,3 @@ class FusionDataset(BaseDataset):
 
     def __len__(self):
         return self.size
-
-
-
-if __name__ == '__main__':
-    # rootA_in = 'C://Users//10219//Downloads//Restoration_Codes//data//solid200//blended//'
-    # rootA_label = 'C://Users//10219//Downloads//Restoration_Codes//data//solid200//transmission_layer//'
-    #
-    # train_set = my_dataset(rootA_in, rootA_label, crop_size =224, fix_sample_A = 20,regular_aug = False)
-    # train_loader = DataLoader(train_set, batch_size=2, num_workers=4, shuffle=True, drop_last=False,pin_memory=True)
-    # for train_idx, train_data in enumerate(train_loader):
-    #     inputs, label, img_name = train_data
-    #     print('---------',train_idx)
-    #     print(inputs.size(),label.size(), img_name)
-
-    # print('-=-=-'*20)
-    # root = 'C://Users//10219//Downloads//Restoration_Codes//data/'
-    # root_txt = 'C://Users//10219//Downloads//Restoration_Codes//solid200.txt'
-
-    #
-    # train_set_wTxt = my_dataset_wTxt(root, root_txt, crop_size =224, fix_sample_A = 20,regular_aug = False)
-    # train_set_wTxt1 = my_dataset_wTxt(root, root_txt1, crop_size =224, fix_sample_A = 20,regular_aug = False)
-    #
-    #
-    # train_loader_wTxt = DataLoader(train_set_wTxt, batch_size=2, num_workers=4, shuffle=True, drop_last=False,pin_memory=True)
-    # for train_idx, train_data in enumerate(train_loader_wTxt):
-    #     inputs, label, img_name = train_data
-    #     print('---------',train_idx)
-    #     print(inputs.size(),label.size(), img_name)
-
-    print('-=-=-' * 20)
-    root = 'D://Datasets//Reflection//Check_SIRR/'
-    root_txt = 'D://Datasets//Reflection//Check_SIRR//DeRef_USTC.txt'
-    root_txt1 = 'D://Datasets//Reflection//Check_SIRR//real_train.txt'
-
-    train_set_wTxt = my_dataset_wTxt(root, root_txt, crop_size=224, fix_sample_A=20, regular_aug=False)
-    train_set_wTxt1 = my_dataset_wTxt(root, root_txt1, crop_size=224, fix_sample_A=200, regular_aug=False)
-
-    train_set = FusionDataset([train_set_wTxt, train_set_wTxt1], [0.7, 0.3])
-    train_loader_wTxt = DataLoader(train_set, batch_size=2, num_workers=4, shuffle=True, drop_last=False,
-                                   pin_memory=True)
-    for train_idx, train_data in enumerate(train_loader_wTxt):
-        inputs, label, img_name = train_data
-        print('---------', train_idx)
-        print(inputs.size(), label.size(), img_name)
-

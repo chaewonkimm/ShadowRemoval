@@ -7,7 +7,6 @@ import torchvision.transforms as transforms
 from torch.utils.data import Dataset,DataLoader
 
 
-
 class my_dataset(Dataset):
     def __init__(self, root_dir, crop_size=256, fix_sample_A=999, regular_aug=False):
         super(my_dataset, self).__init__()
@@ -92,7 +91,6 @@ class my_dataset(Dataset):
 
     def __len__(self):
         return len(self.imgs_in_A)
-
 
 def read_txt(txt_name = 'RealHaze.txt',sample_num=5000):
     path_in = []
@@ -238,7 +236,6 @@ class my_dataset_eval(Dataset):
     def __len__(self):
         return len(self.imgs_in)
 
-
 class DatasetForInference(Dataset):
     def __init__(self, dir_path):
         self.image_paths =  glob.glob( os.path.join(dir_path, '*') )
@@ -260,11 +257,9 @@ class DatasetForInference(Dataset):
         return input_image #, os.path.basename(input_path)
 
 
-
 import bisect
 import warnings
 from torch import randperm
-
 
 class ConcatDataset(Dataset):
     """

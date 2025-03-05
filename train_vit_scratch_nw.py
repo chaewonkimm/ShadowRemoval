@@ -32,16 +32,18 @@ def setup_seed(seed):
 setup_seed(20)
 
 parser = argparse.ArgumentParser(description="stage1")
-parser.add_argument('--experiment_name', type=str, default="train_vit_stage1_nw")
-parser.add_argument('--training_path', type=str, default='../train/', help="Directory containing both '_in' and '_gt' images")
+parser.add_argument('--experiment_name', type=str, default="train_vit_stage1")
+parser.add_argument('--training_path', type=str, default='../train/')
 parser.add_argument('--max_iter', type=int, default=124000)
 parser.add_argument('--img_size', type=str, default="256", help="Initial crop size as H,W or single value")
 parser.add_argument('--BATCH_SIZE', type=int, default=24, help="Initial batch size")
 parser.add_argument('--learning_rate', type=float, default=0.0004)
 parser.add_argument('--print_frequency', type=int, default=50)
-parser.add_argument('--fft_loss_weight', type=float, default=0.0, help="(Not used) Frequency loss weight")
+parser.add_argument('--fft_loss_weight', type=float, default=0.1, help="Weight for FFT loss")
 parser.add_argument('--grid_type', type=str, default="4x4", help="Grid type for dynamic splitting")
 parser.add_argument('--val_interval', type=int, default=5000, help="Interval for validation")
+parser.add_argument('--checkpoint_path', type=str, help="checkpoints", default=None) # pretrained 여부
+parser.add_argument('--resume_iter', type=int, default=0, help="Iteration from which to resume training")
 args = parser.parse_args()
 
 print_args_parameters(args)
@@ -93,7 +95,19 @@ for param_group in optimizer.param_groups:
 scheduler = None
 
 base_loss = losses.CharbonnierLoss()
+fft_loss_fn = losses.fftLoss()
+
 global_iter = 0
+
+if args.checkpoint_path and os.path.exists(args.checkpoint_path):
+    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    net.load_state_dict(checkpoint)
+    global_iter = args.resume_iter
+    print(f"Checkpoint loaded from {args.checkpoint_path}, resuming from iteration {global_iter}")
+    logging.info(f"Checkpoint loaded from {args.checkpoint_path}, resuming from iteration {global_iter}")
+else:
+    print("No checkpoint loaded. Starting training from scratch.")
+
 max_iter = args.max_iter
 train_iter = iter(train_loader)
 
@@ -125,7 +139,8 @@ while global_iter < max_iter:
     processed_sub_images = process_split_image_with_model_parallel(sub_images, net)
     outputs = merge(processed_sub_images, positions)
     loss_char = base_loss(outputs, labels)
-    loss = loss_char
+    loss_fft = fft_loss_fn(outputs, labels)
+    loss = loss_char + args.fft_loss_weight * loss_fft
     loss.backward()
     optimizer.step()
     global_iter += 1
@@ -133,15 +148,22 @@ while global_iter < max_iter:
     if global_iter % args.print_frequency == 0:
         psnr_val = compute_psnr(outputs, labels)
         ssim_val = compute_ssim(outputs, labels)
-        print(f"Iter {global_iter} | CharLoss: {loss_char.item():.4f}, TotalLoss: {loss.item():.4f}, PSNR: {psnr_val:.2f} dB, SSIM: {ssim_val:.4f}")
-        logging.info(f"Iter {global_iter} | CharLoss: {loss_char.item():.4f}, TotalLoss: {loss.item():.4f}, PSNR: {psnr_val:.2f} dB, SSIM: {ssim_val:.4f}")
+        print(f"Iter {global_iter} | CharLoss: {loss_char.item():.4f}, FFTLoss: {loss_fft.item():.4f}, TotalLoss: {loss.item():.4f}, PSNR: {psnr_val:.2f} dB, SSIM: {ssim_val:.4f}")
+        logging.info(f"Iter {global_iter} | CharLoss: {loss_char.item():.4f}, FFTLoss: {loss_fft.item():.4f}, TotalLoss: {loss.item():.4f}, PSNR: {psnr_val:.2f} dB, SSIM: {ssim_val:.4f}")
         wandb.log({
             "iter_loss": loss.item(),
             "iter_char_loss": loss_char.item(),
+            "iter_fft_loss": loss_fft.item(),
             "iter_psnr": psnr_val,
             "iter_ssim": ssim_val,
             "global_iter": global_iter
         })
+
+    if global_iter % 10000 == 0:
+        checkpoint_path = os.path.join(SAVE_PATH, f"vit_stage1_iter_{global_iter}.pth")
+        torch.save(net.state_dict(), checkpoint_path)
+        print(f"Checkpoint saved at iteration {global_iter}")
+        logging.info(f"Checkpoint saved at iteration {global_iter}")
 
     if global_iter % args.val_interval == 0:
         net.eval()
@@ -157,7 +179,8 @@ while global_iter < max_iter:
                 processed_sub_images = process_split_image_with_model_parallel(sub_images, net)
                 outputs = merge(processed_sub_images, positions)
                 loss_char = base_loss(outputs, labels)
-                loss = loss_char
+                loss_fft = fft_loss_fn(outputs, labels)
+                loss = loss_char + args.fft_loss_weight * loss_fft
                 val_total_loss += loss.item()
                 psnr_val = compute_psnr(outputs, labels)
                 ssim_val = compute_ssim(outputs, labels)
@@ -179,7 +202,7 @@ while global_iter < max_iter:
     if phase4_started and scheduler is not None:
         scheduler.step()
 
-torch.save(net.state_dict(), os.path.join(SAVE_PATH, "vit_stage1_nw.pth"))
+torch.save(net.state_dict(), os.path.join(SAVE_PATH, "vit_stage1_wloss.pth"))
 print("Training complete: ViT model saved.")
 logging.info("Training complete: ViT model saved.")
 wandb.finish()

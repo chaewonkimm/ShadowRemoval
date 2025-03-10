@@ -8,7 +8,8 @@ print("Current working directory: {0}".format(cwd))
 from functools import partial
 import torch
 import torch.nn as nn
-from timm.models.vision_transformer import Block
+# from timm.models.vision_transformer import Block
+from networks.vit import Block
 from networks.Patch_embed import PatchEmbed
 import torch.nn.functional as F
 

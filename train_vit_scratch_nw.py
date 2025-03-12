@@ -17,7 +17,8 @@ import wandb
 
 from datasets.datasets_pairs import my_dataset, my_dataset_eval
 from networks.MaeVit_arch import MaskedAutoencoderViT
-from networks.Split_images import split_image, merge, process_split_image_with_model_parallel
+from networks.shadow_matte import ShadowMattePredictor
+from networks.Split_images import split_image, merge, process_split_image_with_model_parallel, process_split_image_with_shadow_matte
 
 sys.path.append(os.getcwd())
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,7 +33,7 @@ def setup_seed(seed):
 setup_seed(20)
 
 parser = argparse.ArgumentParser(description="stage1")
-parser.add_argument('--experiment_name', type=str, default="train_vit_stage1")
+parser.add_argument('--experiment_name', type=str, default="train_vit_stage1_matte")
 parser.add_argument('--training_path', type=str, default='../ntire2025_sh_rem_train/')
 parser.add_argument('--max_iter', type=int, default=124000)
 parser.add_argument('--img_size', type=str, default="256", help="Initial crop size as H,W or single value")
@@ -44,6 +45,7 @@ parser.add_argument('--grid_type', type=str, default="2x2", help="Grid type for 
 parser.add_argument('--val_interval', type=int, default=5000, help="Interval for validation")
 parser.add_argument('--checkpoint_path', type=str, help="checkpoints", default=None) # pretrained 여부
 parser.add_argument('--resume_iter', type=int, default=0, help="Iteration from which to resume training")
+parser.add_argument('--shadow_matte_path', type=str, default="checkpoints/shadow_matte/epoch_1400.pth", help="Path to the shadow matte model weights")
 args = parser.parse_args()
 
 print_args_parameters(args)
@@ -72,13 +74,11 @@ def get_dataloaders(img_size):
 
 train_loader, val_loader = get_dataloaders(current_img_size)
 
-progressive_schedule = [
-    (40000, (512, 512), 12),
-    (76000, (1024, 1024), 5),
-    (100000, (1408, 1408), 3)
-]
-current_schedule_index = 0
-phase4_started = False
+matte_predictor = ShadowMattePredictor(
+    model_path=args.shadow_matte_path,
+    img_size=int(args.img_size) if isinstance(args.img_size, str) and not ',' in args.img_size else 256,
+    device=device
+)
 
 net = MaskedAutoencoderViT(
     patch_size=8, embed_dim=256, depth=6, num_heads=8,
@@ -118,25 +118,18 @@ while global_iter < max_iter:
         train_iter = iter(train_loader)
         data_in, label, img_name = next(train_iter)
 
-    if current_schedule_index < len(progressive_schedule) and global_iter >= progressive_schedule[current_schedule_index][0]:
-        new_img_size, new_batch_size = progressive_schedule[current_schedule_index][1], progressive_schedule[current_schedule_index][2]
-        current_img_size = new_img_size
-        args.BATCH_SIZE = new_batch_size
-        train_loader, val_loader = get_dataloaders(current_img_size)
-        train_iter = iter(train_loader)
-        print(f"Progressive update at iter {global_iter}: img_size -> {current_img_size}, batch_size -> {new_batch_size}")
-        logging.info(f"Progressive update at iter {global_iter}: img_size -> {current_img_size}, batch_size -> {new_batch_size}")
-        if current_img_size == (1408, 1408) and not phase4_started:
-            remaining_iter = max_iter - global_iter
-            scheduler = CosineAnnealingLR(optimizer, T_max=remaining_iter, eta_min=8e-5)
-            phase4_started = True
-        current_schedule_index += 1
-
     optimizer.zero_grad()
     inputs = data_in.to(device)
     labels = label.to(device)
+
+    with torch.no_grad():
+        shadow_matte = matte_predictor.predict_from_tensor(inputs) # [B, 1, img_size, img_size]
+
     sub_images, positions = split_image(inputs, args.grid_type)
-    processed_sub_images = process_split_image_with_model_parallel(sub_images, net)
+    sub_mattes, _ = split_image(shadow_matte, args.grid_type) # [384(B * 16), 1, 64, 64]
+
+    processed_sub_images = process_split_image_with_shadow_matte(sub_images, sub_mattes, net)
+    # processed_sub_images = process_split_image_with_model_parallel(sub_images, net)
     outputs = merge(processed_sub_images, positions)
     loss_char = base_loss(outputs, labels)
     loss_fft = fft_loss_fn(outputs, labels)
@@ -159,12 +152,6 @@ while global_iter < max_iter:
             "global_iter": global_iter
         })
 
-    if global_iter % 10000 == 0:
-        checkpoint_path = os.path.join(SAVE_PATH, f"vit_stage1_iter_{global_iter}.pth")
-        torch.save(net.state_dict(), checkpoint_path)
-        print(f"Checkpoint saved at iteration {global_iter}")
-        logging.info(f"Checkpoint saved at iteration {global_iter}")
-
     if global_iter % args.val_interval == 0:
         net.eval()
         val_total_loss = 0.0
@@ -175,8 +162,14 @@ while global_iter < max_iter:
             for data_in, label, img_name in val_loader:
                 inputs = data_in.to(device)
                 labels = label.to(device)
+
+                shadow_matte = matte_predictor.predict_from_tensor(inputs)
+
                 sub_images, positions = split_image(inputs, args.grid_type)
-                processed_sub_images = process_split_image_with_model_parallel(sub_images, net)
+                sub_mattes, _ = split_image(shadow_matte, args.grid_type)
+                processed_sub_images = process_split_image_with_shadow_matte(sub_images, sub_mattes, net)
+                # processed_sub_images = process_split_image_with_model_parallel(sub_images, net)
+                
                 outputs = merge(processed_sub_images, positions)
                 loss_char = base_loss(outputs, labels)
                 loss_fft = fft_loss_fn(outputs, labels)
@@ -198,8 +191,12 @@ while global_iter < max_iter:
             "val_ssim": avg_val_ssim,
             "global_iter": global_iter
         })
+        checkpoint_path = os.path.join(SAVE_PATH, f"vit_stage1_iter_{global_iter}.pth")
+        torch.save(net.state_dict(), checkpoint_path)
+        print(f"Checkpoint saved at iteration {global_iter}")
+        logging.info(f"Checkpoint saved at iteration {global_iter}")
 
-    if phase4_started and scheduler is not None:
+    if scheduler is not None:
         scheduler.step()
 
 torch.save(net.state_dict(), os.path.join(SAVE_PATH, "vit_stage1_wloss.pth"))

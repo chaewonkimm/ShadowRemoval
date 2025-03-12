@@ -99,7 +99,7 @@ class MaskedAutoencoderViT(nn.Module):
         imgs = x.reshape(x.shape[0], -1, h * p, w * p)
         return imgs
 
-    def forward_encoder(self, imgs):
+    def forward_encoder(self, imgs, shadow_matte=None):
         x = self.patch_embed(imgs)
         fft_result = torch.fft.fft2(imgs, dim=(-2, -1))
         freq_magnitude = torch.abs(fft_result)
@@ -109,22 +109,22 @@ class MaskedAutoencoderViT(nn.Module):
         beta = self.film_beta(freq_repr).unsqueeze(1)
         x = gamma * x + beta
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, shadow_matte)
         x = self.norm(x)
         return x
 
-    def forward_decoder(self, x):
+    def forward_decoder(self, x, shadow_matte=None):
         x = self.decoder_embed(x)
         for blk in self.decoder_blocks:
-            x = blk(x)
+            x = blk(x, shadow_matte)
         x = self.decoder_norm(x)
         x = self.decoder_pred(x)
         return x
 
-    def forward(self, imgs):
+    def forward(self, imgs, shadow_matte=None):
         _, _, ori_H, ori_W = imgs.size()
-        latent = self.forward_encoder(imgs)
-        pred = self.forward_decoder(latent)
+        latent = self.forward_encoder(imgs, shadow_matte)
+        pred = self.forward_decoder(latent, shadow_matte)
         pred_wOri_Size = self.unpatchify(pred, ori_H, ori_W)
         pred_wOri_Size = self.last_conv(self.pyramid_module(pred_wOri_Size))
         if self.global_residual:

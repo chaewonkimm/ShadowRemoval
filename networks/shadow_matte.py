@@ -398,7 +398,6 @@ class VisionTransformer(nn.Module):
         return logits
 
 
-# Configuration class
 class ShadowMatteConfig:
     def __init__(self, img_size=128, patch_size=16, in_channels=3):
         # ViT configuration
@@ -424,7 +423,7 @@ class ShadowMatteConfig:
 # --------------- Inference Code ---------------
 
 class ShadowMattePredictor:
-    def __init__(self, model_path, img_size=128, device=None):
+    def __init__(self, model_path, img_size=256, device=None):
         self.img_size = img_size
         self.device = device if device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
@@ -533,13 +532,11 @@ class ShadowMattePredictor:
         if filename_base is None:
             filename_base = 'result'
             
-        # Save original image
         cv2.imwrite(
             os.path.join(output_dir, f"{filename_base}_original.png"), 
             cv2.cvtColor(original_img, cv2.COLOR_RGB2BGR)
         )
-        
-        # Save shadow matte
+
         matte_img = (shadow_matte * 255).astype(np.uint8)
         cv2.imwrite(os.path.join(output_dir, f"{filename_base}_matte.png"), matte_img)
 
@@ -550,26 +547,21 @@ class ShadowMattePredictor:
             # 'shadow_removed': os.path.join(output_dir, f"{filename_base}_shadow_removed.png")
         }
 
-
-# Command-line interface
 def main():
     parser = argparse.ArgumentParser(description='Shadow Matte Generation')
     parser.add_argument('--input', type=str, required=True, help='Input image path')
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     parser.add_argument('--model_path', type=str, required=True, help='Path to the trained model')
-    parser.add_argument('--img_size', type=int, default=128, help='Image size for inference')
+    parser.add_argument('--img_size', type=int, default=256, help='Image size for inference')
     args = parser.parse_args()
     
-    # Create the predictor
     predictor = ShadowMattePredictor(
         model_path=args.model_path,
         img_size=args.img_size
     )
     
-    # Generate shadow matte
     shadow_matte, original_img = predictor.predict(args.input)
     
-    # Save results
     filename_base = os.path.splitext(os.path.basename(args.input))[0]
     predictor.save_results(shadow_matte, original_img, args.output_dir, filename_base)
     

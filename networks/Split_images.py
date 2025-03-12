@@ -130,6 +130,23 @@ def process_split_image_with_model_parallel(sub_images,model): #image_path, grid
     images = [image[i] for i in range(L)]               # 将四张图恢复成列表形式
     return images
 
+def process_split_image_with_shadow_matte(sub_images, sub_mattes, model):
+    """Process split images with shadow matte information"""
+    n, c, h, w = sub_images[0].shape
+    L = len(sub_images)
+    
+    merged_tensor = torch.stack(sub_images, dim=0)
+    reshaped_tensor = merged_tensor.view(n*L, c, h, w)
+
+    merged_matte = torch.stack(sub_mattes, dim=0)
+    reshaped_matte = merged_matte.view(n*L, 1, h, w)
+
+    processed_sub_images = model(reshaped_tensor, reshaped_matte)
+
+    image = processed_sub_images.view(L, n, c, h, w)
+    images = [image[i] for i in range(L)]
+    
+    return images
 
 
 def preprocess_image(image_path, grid_type):

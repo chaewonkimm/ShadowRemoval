@@ -33,15 +33,15 @@ def setup_seed(seed):
 setup_seed(20)
 
 parser = argparse.ArgumentParser(description="stage1")
-parser.add_argument('--experiment_name', type=str, default="train_vit_stage1_matte")
-parser.add_argument('--training_path', type=str, default='../ntire2025_sh_rem_train/')
-parser.add_argument('--max_iter', type=int, default=124000)
+parser.add_argument('--experiment_name', type=str, default="vit_weight0.1_aug_sch")
+parser.add_argument('--training_path', type=str, default='../aug_images/')
+parser.add_argument('--max_iter', type=int, default=480000)
 parser.add_argument('--img_size', type=str, default="256", help="Initial crop size as H,W or single value")
 parser.add_argument('--BATCH_SIZE', type=int, default=24, help="Initial batch size")
 parser.add_argument('--learning_rate', type=float, default=0.0004)
 parser.add_argument('--print_frequency', type=int, default=50)
 parser.add_argument('--fft_loss_weight', type=float, default=0.1, help="Weight for FFT loss")
-parser.add_argument('--grid_type', type=str, default="2x2", help="Grid type for dynamic splitting")
+parser.add_argument('--grid_type', type=str, default="4x4", help="Grid type for dynamic splitting")
 parser.add_argument('--val_interval', type=int, default=5000, help="Interval for validation")
 parser.add_argument('--checkpoint_path', type=str, help="checkpoints", default=None) # pretrained 여부
 parser.add_argument('--resume_iter', type=int, default=0, help="Iteration from which to resume training")
@@ -92,7 +92,7 @@ logging.info(f"#parameters: {sum(p.numel() for p in net.parameters())}")
 optimizer = optim.Adam(net.parameters(), lr=args.learning_rate, betas=(0.9, 0.999))
 for param_group in optimizer.param_groups:
     param_group['lr'] = args.learning_rate
-scheduler = None
+scheduler = CosineAnnealingLR(optimizer, T_max=args.max_iter, eta_min=8e-5)
 
 base_loss = losses.CharbonnierLoss()
 fft_loss_fn = losses.fftLoss()
@@ -199,7 +199,7 @@ while global_iter < max_iter:
     if scheduler is not None:
         scheduler.step()
 
-torch.save(net.state_dict(), os.path.join(SAVE_PATH, "vit_stage1_wloss.pth"))
+torch.save(net.state_dict(), os.path.join(SAVE_PATH, "vit_stage1_weight.pth"))
 print("Training complete: ViT model saved.")
 logging.info("Training complete: ViT model saved.")
 wandb.finish()

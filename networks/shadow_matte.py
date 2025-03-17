@@ -9,16 +9,6 @@ from collections import OrderedDict
 import math
 import copy
 
-
-# --------------- Model Definition ---------------
-
-def np2th(weights, conv=False):
-    """Possibly convert HWIO to OIHW."""
-    if conv:
-        weights = weights.transpose([3, 2, 0, 1])
-    return torch.from_numpy(weights)
-
-
 def swish(x):
     return x * torch.sigmoid(x)
 
@@ -435,76 +425,13 @@ class ShadowMattePredictor:
             num_classes=1,
             vis=False
         ).to(self.device)
-        
-        # Load the model weights
 
         checkpoint = torch.load(model_path, map_location=device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
 
-        # self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
-        
-        # print(f"Model loaded on {self.device}")
-    
-    def preprocess(self, image_path):
-        """
-        Preprocess an image for inference
-        """
-        # Read and resize image
-        img = cv2.imread(image_path)
-        if img is None:
-            raise ValueError(f"Could not read image at {image_path}")
-            
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        current_h, current_w = img.shape[:2]
-        
-        # Only resize if needed
-        if current_h != self.img_size or current_w != self.img_size:
-            img_resized = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_AREA)
-        else:
-            img_resized = img
-            
-        # Normalize and convert to tensor
-        img_tensor = torch.from_numpy(img_resized.astype(np.float32) / 255.0).permute(2, 0, 1)
-        
-        return img_tensor, img
-    
-    def predict(self, image_path):
-        """
-        Generate shadow matte for an image
-        """
-        # Preprocess the image
-        img_tensor, original_img = self.preprocess(image_path)
-        
-        # Perform inference
-        with torch.no_grad():
-            img_tensor = img_tensor.unsqueeze(0).to(self.device)
-            output = self.model(img_tensor)
-            
-        # Get the shadow matte
-        # shadow_matte = output.squeeze().cpu().numpy()
-        shadow_matte = output
-
-        return shadow_matte
-    
-    def predict_batch(self, image_paths):
-        """
-        Generate shadow mattes for a batch of images
-        """
-        results = []
-        
-        for image_path in image_paths:
-            shadow_matte, original_img = self.predict(image_path)
-            results.append((shadow_matte, original_img))
-            
-        return results
     
     def predict_from_tensor(self, img_tensor):
-        """
-        Generate shadow matte directly from a tensor
-        img_tensor: Shape [3, H, W] or [B, 3, H, W]
-        """
-
         if img_tensor.dim() == 3:
             img_tensor = img_tensor.unsqueeze(0)
 
@@ -524,9 +451,6 @@ class ShadowMattePredictor:
         return output
     
     def save_results(self, shadow_matte, original_img, output_dir, filename_base=None):
-        """
-        Save shadow matte and visualization
-        """
         os.makedirs(output_dir, exist_ok=True)
         
         if filename_base is None:

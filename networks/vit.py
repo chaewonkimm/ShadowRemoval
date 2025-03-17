@@ -62,14 +62,14 @@ class Attention(nn.Module):
 
             if shadow_matte is not None:
 
-                shadow_weight_factor = 0.5
+                shadow_weight_factor = 0.1
                 B, _, H, W = shadow_matte.shape 
 
                 patch_size = int(math.sqrt(N))
 
-                shadow_resized = F.interpolate(shadow_matte, size=(patch_size, patch_size), mode='bilinear')
-
-                shadow_flat = shadow_resized.reshape(B, 1, N)
+                # interpolation
+                shadow_resized = F.interpolate(shadow_matte, size=(patch_size, patch_size), mode='bilinear') # [96, 1, 16, 16]
+                shadow_flat = shadow_resized.reshape(B, 1, N) # [96, 1, 256]
                 
                 shadow_weight = 1.0 + (shadow_weight_factor * shadow_flat)
                 shadow_weight = shadow_weight.unsqueeze(1).expand(-1, self.num_heads, -1, -1)

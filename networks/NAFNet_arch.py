@@ -321,16 +321,13 @@ class NAFBlock_wIN(nn.Module):
     
 
 class NAFNet(nn.Module):
-
     def __init__(self, img_channel=3, width=32, middle_blk_num=1, enc_blk_nums=[1, 1, 1, 28],
-                 dec_blk_nums=[1, 1, 1, 1], global_residual = False, drop_flag = False, drop_rate = 0.4, MultiScale =False, kernel_size = 3):
+                 dec_blk_nums=[1, 1, 1, 1], global_residual=False, drop_flag=False, drop_rate=0.4, MultiScale=False, kernel_size=3):
         super().__init__()
-
-        self.intro = nn.Conv2d(in_channels=img_channel, out_channels=width, kernel_size=3, padding=1, stride=1, groups=1,
-                              bias=True)
-        self.ending = nn.Conv2d(in_channels=width, out_channels=3, kernel_size=3, padding=1, stride=1, groups=1,
-                              bias=True)
-
+        
+        self.intro = nn.Conv2d(in_channels=img_channel, out_channels=width, kernel_size=3, padding=1, stride=1, bias=True)
+        self.ending = nn.Conv2d(in_channels=width, out_channels=3, kernel_size=3, padding=1, stride=1, bias=True)
+        
         self.encoders = nn.ModuleList()
         self.decoders = nn.ModuleList()
         self.middle_blks = nn.ModuleList()
@@ -338,27 +335,29 @@ class NAFNet(nn.Module):
         self.downs = nn.ModuleList()
         self.global_residual = global_residual
         self.drop_flag = drop_flag
-        
+
         if drop_flag:
             self.dropout = nn.Dropout2d(p=drop_rate)
-
+        
         chan = width
+        self.enc_channels = []
         for num in enc_blk_nums:
             self.encoders.append(
                 nn.Sequential(
                     *[NAFBlock(chan, kernel_size) for _ in range(num)]
                 )
             )
+            self.enc_channels.append(chan)
             self.downs.append(
-                nn.Conv2d(chan, 2*chan, 2, 2)
+                nn.Conv2d(chan, 2 * chan, 2, 2)
             )
             chan = chan * 2
 
-        self.middle_blks = \
-            nn.Sequential(
-                *[NAFBlock(chan, kernel_size) for _ in range(middle_blk_num)]
-            )
-
+        self.middle_blks = nn.Sequential(
+            *[NAFBlock(chan, kernel_size) for _ in range(middle_blk_num)]
+        )
+        
+        self.dec_channels = []
         for num in dec_blk_nums:
             self.ups.append(
                 nn.Sequential(
@@ -367,15 +366,22 @@ class NAFNet(nn.Module):
                 )
             )
             chan = chan // 2
+            self.dec_channels.append(chan)
             self.decoders.append(
                 nn.Sequential(
                     *[NAFBlock(chan, kernel_size) for _ in range(num)]
                 )
             )
-
+        
+        self.fuse_convs = nn.ModuleList()
+        for ch in self.enc_channels[::-1]:
+            self.fuse_convs.append(nn.Conv2d(ch * 2, ch, kernel_size=1, bias=True))
+        
         self.padder_size = 2 ** len(self.encoders)
-        self.PyramidPooling = PyramidPooling(width,width)
+        self.PyramidPooling = PyramidPooling(width, width)
         self.MultiScale = MultiScale
+
+    
     def forward(self, inp):
         B, C, H, W = inp.shape
         inp = self.check_image_size(inp)
@@ -383,7 +389,6 @@ class NAFNet(nn.Module):
         x = self.intro(inp)
 
         encs = []
-
         for encoder, down in zip(self.encoders, self.downs):
             x = encoder(x)
             encs.append(x)
@@ -391,23 +396,20 @@ class NAFNet(nn.Module):
 
         x = self.middle_blks(x)
 
-        for decoder, up, enc_skip in zip(self.decoders, self.ups, encs[::-1]):
+        for decoder, up, enc_skip, fuse_conv in zip(self.decoders, self.ups, encs[::-1], self.fuse_convs):
             x = up(x)
-            x = x + enc_skip
+            x = torch.cat([x, enc_skip], dim=1)
+            x = fuse_conv(x)
             x = decoder(x)
         
         if self.MultiScale:
             x = self.PyramidPooling(x)
-            
         if self.drop_flag:
             x = self.dropout(x)
         
         x = self.ending(x)
         if self.global_residual:
-            #print(x.shape, inp.shape, base_inp.shape)
             x = x + base_inp
-        else:
-            x
         return x[:, :, :H, :W]
 
     def check_image_size(self, x):

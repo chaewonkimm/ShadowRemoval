@@ -65,7 +65,7 @@ class my_dataset(Dataset):
 
         patch_size = patch_size
         ix = random.randrange(0, max(0, iw - patch_size))
-        iy = random.randrange(0, max(0, ih - patch_size))
+        iy = random.randrange(0, max(1, ih - patch_size + 1))
         img = img[iy:iy + patch_size, ix: ix + patch_size]
         label = label[iy:iy + patch_size, ix: ix + patch_size]
 
@@ -167,7 +167,7 @@ class my_dataset_wTxt(Dataset):
 
         patch_size = patch_size
         ix = random.randrange(0, max(0, iw - patch_size))
-        iy = random.randrange(0, max(0, ih - patch_size))
+        iy = random.randrange(0, max(1, ih - patch_size + 1))
         img = img[iy:iy + patch_size, ix: ix + patch_size]
         label = label[iy:iy + patch_size, ix: ix + patch_size]
 

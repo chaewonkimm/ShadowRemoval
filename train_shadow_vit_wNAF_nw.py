@@ -20,6 +20,24 @@ from PIL import Image
 import wandb
 sys.path.append(os.getcwd())
 
+def get_high_freq_weight_map(target, device, kernel_size=3, padding=1):
+    laplacian_kernel = torch.tensor([[0, -1, 0],
+                                     [-1, 4, -1],
+                                     [0, -1, 0]], dtype=torch.float32, device=device)
+    laplacian_kernel = laplacian_kernel.unsqueeze(0).unsqueeze(0)  # (1, 1, 3, 3)
+    C = target.size(1)
+    laplacian_kernel = laplacian_kernel.repeat(C, 1, 1, 1)
+    high_freq = nn.functional.conv2d(target, laplacian_kernel, groups=C, padding=padding)
+    weight_map = torch.abs(high_freq)
+    weight_map = (weight_map - weight_map.min()) / (weight_map.max() - weight_map.min() + 1e-8)
+    return weight_map
+
+def weighted_charbonnier_loss(output, target, epsilon=1e-3):
+    device = output.device
+    weight_map = get_high_freq_weight_map(target, device)
+    loss = torch.sqrt(weight_map * (output - target)**2 + epsilon**2)
+    return loss.mean()
+
 def split_image_overlap(img, crop_size, overlap_size):
     B, C, H, W = img.shape
     stride = crop_size - overlap_size
@@ -123,14 +141,14 @@ parser.add_argument('--overlap_size', type=int, default=16) # ViT crop 방식
 parser.add_argument('--crop_stride', type=int, default=250, help="Stride for sliding crop from left")
 parser.add_argument('--Flag_process_split_image_with_model_parallel', type=bool, default=True)
 parser.add_argument('--Flag_multi_scale', type=bool, default=False)
-parser.add_argument('--experiment_name', type=str, default="train_nafnet_wmatte_sliding_matte")
+parser.add_argument('--experiment_name', type=str, default="train_nafnet_wmatte_sliding_matte3")
 parser.add_argument('--unified_path', type=str, default='/root/autodl-tmp/SR_1/')
 parser.add_argument('--T_period', type=int, default=50)
 parser.add_argument('--training_path', type=str, default='../data/aug_images', help='Training images folder')
 parser.add_argument('--writer_dir', type=str, default='/root/tf-logs/')
 parser.add_argument('--infer_path', type=str, default='./test/input', help='Inference input images folder')
-parser.add_argument('--iteration_target', type=int, default=120000)
-parser.add_argument('--BATCH_SIZE', type=int, default=1)
+parser.add_argument('--iteration_target', type=int, default=75000)
+parser.add_argument('--BATCH_SIZE', type=int, default=2)
 parser.add_argument('--Crop_patches', type=int, default=0) # 원본 크기 유지 (1000X750)
 parser.add_argument('--learning_rate', type=float, default=8e-5)
 parser.add_argument('--print_frequency', type=int, default=50)
@@ -139,12 +157,12 @@ parser.add_argument('--SAVE_Inter_Results', type=bool, default=False)
 parser.add_argument('--fix_sampleA', type=int, default=999)
 parser.add_argument('--debug', type=bool, default=False)
 parser.add_argument('--Aug_regular', type=bool, default=False)
-parser.add_argument('--base_channel', type=int, default=24)
-parser.add_argument('--num_res', type=int, default=6)
+parser.add_argument('--base_channel', type=int, default=32)
+parser.add_argument('--num_res', type=int, default=24)
 parser.add_argument('--img_channel', type=int, default=3)
 parser.add_argument('--enc_blks', nargs='+', type=int, default=[1, 1, 1, 28], help='List of integers')
 parser.add_argument('--dec_blks', nargs='+', type=int, default=[1, 1, 1, 1], help='List of integers')
-parser.add_argument('--base_loss', type=str, default='char')
+parser.add_argument('--base_loss', type=str, default='weightedchar')
 parser.add_argument('--addition_loss', type=str, default='None')
 parser.add_argument('--addition_loss_coff', type=float, default=0.02)
 parser.add_argument('--weight_coff', type=float, default=10.0)
@@ -343,8 +361,7 @@ if __name__ == '__main__':
         optimizerG = optim.Adam(net_1.parameters(), lr=args.learning_rate, betas=(0.9, 0.999))
     for param in net.parameters():
         param.requires_grad = False
-    base_loss = losses.CharbonnierLoss() if args.base_loss.lower() == 'char' else (
-        losses.WeightedCharbonnierLoss(eps=1e-4, weight=args.weight_coff) if args.base_loss.lower() == 'weightedchar' else nn.L1Loss())
+    base_loss = weighted_charbonnier_loss if args.base_loss.lower() == 'weightedchar' else nn.L1Loss()
     if args.addition_loss.lower() == 'vgg':
         criterion = losses.VGGLoss()
     elif args.addition_loss.lower() == 'ssim':
@@ -389,6 +406,13 @@ if __name__ == '__main__':
             loss_total.backward()
             optimizerG.step()
             global_iter += 1
+
+            if global_iter % 10000 == 0:
+                checkpoint_path = os.path.join(SAVE_PATH, f"checkpoint_iter_{global_iter}.pth")
+                torch.save(net_1.state_dict(), checkpoint_path)
+                print(f"Checkpoint saved at iteration {global_iter}")
+                logging.info(f"Checkpoint saved at iteration {global_iter}")
+            
             if (i + 1) % args.print_frequency == 0 and i > 1:
                 psnr_val = compute_psnr(nafnet_output, labels)
                 ssim_val = compute_ssim(nafnet_output, labels)

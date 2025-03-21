@@ -22,6 +22,225 @@ import sys
 sys.path.append('/ghome/zhuyr/Deref_RW/networks/')
 from .local_arch import Local_Base
 
+class ChannelAttention(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc = nn.Sequential(
+            nn.Conv2d(channel, channel // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // reduction, channel, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x, shadow_matte=None):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_out = torch.cat([avg_out, max_out], dim=1)
+        x_out = self.conv(x_out)
+        
+        if shadow_matte is not None:
+            shadow_weight_factor = 0.5
+            B, C, H, W = x.shape
+
+            if shadow_matte.shape[2:] != (H, W):
+                shadow_matte = F.interpolate(shadow_matte, size=(H, W), mode='bilinear', align_corners=False)
+
+            x_out = x_out + shadow_weight_factor * shadow_matte
+            
+        return self.sigmoid(x_out)
+
+class CBAM(nn.Module):
+    def __init__(self, channel):
+        super(CBAM, self).__init__()
+        self.channel_att = ChannelAttention(channel)
+        self.spatial_att = SpatialAttention()
+        
+    def forward(self, x, shadow_matte=None):
+        x = x * self.channel_att(x)
+        if shadow_matte is not None:
+            x = x * self.spatial_att(x, shadow_matte)
+        else:
+            x = x * self.spatial_att(x)
+        return x
+
+class NAFBlock_CBAM(nn.Module):
+    def __init__(self, c, kernel_size=3, DW_Expand=2, FFN_Expand=2, drop_out_rate=0.):
+        super().__init__()
+        dw_channel = c * DW_Expand
+        self.conv1 = nn.Conv2d(in_channels=c, out_channels=dw_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        self.conv2 = nn.Conv2d(in_channels=dw_channel, out_channels=dw_channel, kernel_size=kernel_size, padding=(kernel_size - 1) // 2, stride=1, groups=dw_channel,
+                               bias=True)
+        self.conv3 = nn.Conv2d(in_channels=dw_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+
+        self.sg = SimpleGate()
+
+        self.cbam = CBAM(dw_channel // 2)
+
+        ffn_channel = FFN_Expand * c
+        self.conv4 = nn.Conv2d(in_channels=c, out_channels=ffn_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        self.conv5 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+
+        self.norm1 = LayerNorm2d(c)
+        self.norm2 = LayerNorm2d(c)
+
+        self.dropout1 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
+        self.dropout2 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
+
+        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+
+    def forward(self, inp, shadow_matte=None):
+        x = inp
+
+        x = self.norm1(x)
+
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.sg(x)
+        
+        # CBAM 적용
+        x = self.cbam(x, shadow_matte)
+        
+        x = self.conv3(x)
+
+        x = self.dropout1(x)
+
+        y = inp + x * self.beta
+
+        x = self.conv4(self.norm2(y))
+        x = self.sg(x)
+        x = self.conv5(x)
+
+        x = self.dropout2(x)
+
+        return y + x * self.gamma
+
+class NAFNet_CBAM(nn.Module):
+    def __init__(self, img_channel=3, width=32, middle_blk_num=1, enc_blk_nums=[1, 1, 1, 28],
+                 dec_blk_nums=[1, 1, 1, 1], global_residual=False, drop_flag=False, drop_rate=0.4, MultiScale=False, kernel_size=3):
+        super().__init__()
+        
+        self.intro = nn.Conv2d(in_channels=img_channel, out_channels=width, kernel_size=3, padding=1, stride=1, bias=True)
+        self.ending = nn.Conv2d(in_channels=width, out_channels=3, kernel_size=3, padding=1, stride=1, bias=True)
+        
+        self.encoders = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        self.middle_blks = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.downs = nn.ModuleList()
+        self.global_residual = global_residual
+        self.drop_flag = drop_flag
+
+        if drop_flag:
+            self.dropout = nn.Dropout2d(p=drop_rate)
+        
+        chan = width
+        self.enc_channels = []
+        for num in enc_blk_nums:
+            self.encoders.append(
+                nn.Sequential(
+                    *[NAFBlock_CBAM(chan, kernel_size) for _ in range(num)]
+                )
+            )
+            self.enc_channels.append(chan)
+            self.downs.append(
+                nn.Conv2d(chan, 2 * chan, 2, 2)
+            )
+            chan = chan * 2
+
+        self.middle_blks = nn.Sequential(
+            *[NAFBlock_CBAM(chan, kernel_size) for _ in range(middle_blk_num)]
+        )
+        
+        self.dec_channels = []
+        for num in dec_blk_nums:
+            self.ups.append(
+                nn.Sequential(
+                    nn.Conv2d(chan, chan * 2, 1, bias=False),
+                    nn.PixelShuffle(2)
+                )
+            )
+            chan = chan // 2
+            self.dec_channels.append(chan)
+            self.decoders.append(
+                nn.Sequential(
+                    *[NAFBlock_CBAM(chan, kernel_size) for _ in range(num)]
+                )
+            )
+        
+        self.fuse_convs = nn.ModuleList()
+        for ch in self.enc_channels[::-1]:
+            self.fuse_convs.append(nn.Conv2d(ch * 2, ch, kernel_size=1, bias=True))
+        
+        self.padder_size = 2 ** len(self.encoders)
+        self.PyramidPooling = PyramidPooling(width, width)
+        self.MultiScale = MultiScale
+
+    def forward(self, inp, shadow_matte=None):
+        B, C, H, W = inp.shape
+        inp = self.check_image_size(inp)
+        base_inp = inp[:, :3, :, :]
+        x = self.intro(inp)
+
+        encs = []
+        for i, (encoder, down) in enumerate(zip(self.encoders, self.downs)):
+            if shadow_matte is not None:
+                for block in encoder:
+                    x = block(x, shadow_matte)
+            else:
+                x = encoder(x)
+            encs.append(x)
+            x = down(x)
+
+        if shadow_matte is not None:
+            for block in self.middle_blks:
+                x = block(x, shadow_matte)
+        else:
+            x = self.middle_blks(x)
+
+        for decoder, up, enc_skip, fuse_conv in zip(self.decoders, self.ups, encs[::-1], self.fuse_convs):
+            x = up(x)
+            x = torch.cat([x, enc_skip], dim=1)
+            x = fuse_conv(x)
+
+            if shadow_matte is not None:
+                for block in decoder:
+                    x = block(x, shadow_matte)
+            else:
+                x = decoder(x)
+        
+        if self.MultiScale:
+            x = self.PyramidPooling(x)
+        if self.drop_flag:
+            x = self.dropout(x)
+        
+        x = self.ending(x)
+        if self.global_residual:
+            x = x + base_inp
+        return x[:, :, :H, :W]
+
+    def check_image_size(self, x):
+        _, _, h, w = x.size()
+        mod_pad_h = (self.padder_size - h % self.padder_size) % self.padder_size
+        mod_pad_w = (self.padder_size - w % self.padder_size) % self.padder_size
+        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h))
+        return x
+
 #  channel attention
 class CALayer(nn.Module):
     def __init__(self, channel,ratio=4):

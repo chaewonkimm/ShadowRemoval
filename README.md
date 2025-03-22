@@ -1,6 +1,7 @@
 # MatteViT: Shadow-Aware Transformer for High-Fidelity Shadow Removal
 
-We propose a novel shadow removal framework, **MatteViT**, designed for the **NTIRE 2025 Image Shadow Removal Challenge**. MatteViT integrates shadow matte guidance with advanced neural architectures to effectively address the challenging task of shadow removal.
+We propose a novel shadow removal framework, **MatteViT**, designed for the **New Trends in Image Restoration and Enhancement workshop and associated challenges in conjunction with CVPR 2025**. <br> 
+MatteViT integrates shadow matte guidance with advanced neural architectures to effectively address the challenging task of shadow removal.
 
 ![Figure](images/Fig1.png)
 

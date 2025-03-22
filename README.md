@@ -2,7 +2,7 @@
 
 We propose a novel shadow removal framework, **MatteViT**, designed for the **NTIRE 2025 Image Shadow Removal Challenge**. MatteViT integrates shadow matte guidance with advanced neural architectures to effectively address the challenging task of shadow removal.
 
-![Figure](Fig1.png)
+![Figure](images/Fig1.png)
 
 ## Requirements
 To get started, install all requirements using:

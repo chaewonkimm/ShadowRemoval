@@ -26,3 +26,15 @@ python inference.py --vit_checkpoint [PATH_TO_VIT_CHECKPOINT] \
                     --input_dir [INPUT_DIRECTORY] \
                     --output_dir [OUTPUT_DIRECTORY]
 ```
+
+## BibTeX
+```
+@InProceedings{Lu_2024_CVPR,
+    author    = {Lu, Xin and Zhu, Yurui and Wang, Xi and Li, Dong and Xiao, Jie and Zhang, Yunpeng and Fu, Xueyang and Zha, Zheng-Jun},
+    title     = {HirFormer: Dynamic High Resolution Transformer for Large-Scale Image Shadow Removal},
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) Workshops},
+    month     = {June},
+    year      = {2024},
+    pages     = {6513-6523}
+}
+```

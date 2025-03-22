@@ -9,6 +9,7 @@ To get started, install all requirements using:
 ```
 pip install -r requirements.txt
 ```
+<br>
 
 ## Pretrained Models
 Download the pre-trained models from the following Google Drive links:
@@ -16,6 +17,7 @@ Download the pre-trained models from the following Google Drive links:
 - [MatteViT](https://drive.google.com/file/d/1_xpq4dE1GHmo6lHfzDUQk5e6GeI2DuAs/view?usp=sharing)
 - [Spatial NAFNet](https://drive.google.com/file/d/1mWsq7EVt79gjTF0S61iTScGJyqyUbL4I/view?usp=sharing)
 
+<br>
 
 ## Usage
 You can run inference using the pre-trained model with the following command:
@@ -26,6 +28,7 @@ python inference.py --vit_checkpoint [PATH_TO_VIT_CHECKPOINT] \
                     --input_dir [INPUT_DIRECTORY] \
                     --output_dir [OUTPUT_DIRECTORY]
 ```
+<br>
 
 ## BibTeX
 ```

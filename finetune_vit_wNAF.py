@@ -17,6 +17,7 @@ from networks.MaeVit_arch import MaskedAutoencoderViT
 from networks.shadow_matte import ShadowMattePredictor
 from networks.Split_images import split_image, merge, process_split_image_with_model_parallel, process_split_image_with_shadow_matte
 from PIL import Image
+import torchvision.utils as vutils
 import wandb
 sys.path.append(os.getcwd())
 
@@ -32,10 +33,10 @@ def get_high_freq_weight_map(target, device, kernel_size=3, padding=1):
     weight_map = (weight_map - weight_map.min()) / (weight_map.max() - weight_map.min() + 1e-8)
     return weight_map
 
-def weighted_charbonnier_loss(output, target, epsilon=1e-3, weight_coff=1):
+def weighted_charbonnier_loss(output, target, epsilon=1e-3, weight_coef=10.0):
     device = output.device
     weight_map = get_high_freq_weight_map(target, device)
-    loss = torch.sqrt(weight_coff * weight_map * (output - target)**2 + epsilon**2)
+    loss = torch.sqrt(weight_coef * weight_map * (output - target)**2 + epsilon**2)
     return loss.mean()
 
 def split_image_overlap(img, crop_size, overlap_size):
@@ -138,21 +139,20 @@ parser.add_argument('--vit_mlp_ratio', type=int, default=4)
 parser.add_argument('--vit_img_size', type=int, default=256)  # ViT input size with matte
 parser.add_argument('--img_size', type=int, default=750)  # sliding crop size (750x750)
 parser.add_argument('--grid_type', type=str, default="4x4", help="Grid type for dynamic splitting (NAFNet)")
-parser.add_argument('--overlap_size', type=int, default=16)  # overlap for 256x256 patch split
+parser.add_argument('--overlap_size', type=int, default=64)  # overlap for 256x256 patch split
 parser.add_argument('--crop_stride', type=int, default=250, help="Stride for sliding crop from left")
 parser.add_argument('--Flag_process_split_image_with_model_parallel', type=bool, default=True)
 parser.add_argument('--Flag_multi_scale', type=bool, default=False)
-parser.add_argument('--experiment_name', type=str, default="finetune_vit_wnafnet_matte0.1_CBAM")
-parser.add_argument('--unified_path', type=str, default='./autodl-tmp/SR_1/')
+parser.add_argument('--experiment_name', type=str, default="finetune_vit_wnafnet")
+parser.add_argument('--unified_path', type=str, default='./tmp/')
 parser.add_argument('--T_period', type=int, default=50)
-parser.add_argument('--training_path', type=str, default='../aug_images', help='Training images folder')
-parser.add_argument('--writer_dir', type=str, default='./tf-logs/')
-parser.add_argument('--infer_path', type=str, default='./test/input', help='Inference input images folder')
-parser.add_argument('--iteration_target', type=int, default=80000)
+parser.add_argument('--training_path', type=str, default='../data/', help='Training images folder')
+parser.add_argument('--writer_dir', type=str, default='./results/')
+parser.add_argument('--infer_path', type=str, default='./test/', help='Inference input images folder')
+parser.add_argument('--iteration_target', type=int, default=35000)
 parser.add_argument('--BATCH_SIZE', type=int, default=1)
 parser.add_argument('--Crop_patches', type=int, default=0)
-parser.add_argument('--nafnet_learning_rate', type=float, default=2e-4)
-parser.add_argument('--vit_learning_rate', type=float, default=8e-5)
+parser.add_argument('--learning_rate', type=float, default=8e-5)
 parser.add_argument('--print_frequency', type=int, default=50)
 parser.add_argument('--fft_loss_weight', type=float, default=0.1, help="Weight for FFT loss")
 parser.add_argument('--SAVE_Inter_Results', type=bool, default=False)
@@ -169,10 +169,10 @@ parser.add_argument('--addition_loss', type=str, default='None')
 parser.add_argument('--addition_loss_coff', type=float, default=0.02)
 parser.add_argument('--weight_coff', type=float, default=10.0)
 parser.add_argument('--load_pre_model', type=bool, default=False)
-parser.add_argument('--pre_model', type=str, default='./pretrained/vit_matte_weight0.1_finetuning.pth')
-parser.add_argument('--pre_model_0', type=str, default='./pretrained/vit_matte_weight0.1_finetuning.pth')
-parser.add_argument('--pre_model_1', type=str, default='../autodl-tmp/SR_1/train_nafnet_wmatte_matte_depth/checkpoint_iter_40000.pth')
-parser.add_argument('--shadow_matte_path', type=str, default="pretrained/epoch_1400.pth")
+parser.add_argument('--pre_model', type=str, default='./files/vit.pth')
+parser.add_argument('--pre_model_0', type=str, default='./files/vit.pth')
+parser.add_argument('--pre_model_1', type=str, default='./files/nafnet.pth')
+parser.add_argument('--shadow_matte_path', type=str, default="./files/shadow_matte_generator")
 parser.add_argument('--optim', type=str, default='adam')
 args = parser.parse_args()
 print_args_parameters(args)
@@ -265,17 +265,25 @@ def validate(net, net_1, val_loader, val_save_dir, iteration):
             crops, crop_positions = sliding_crop_left(inputs, patch_size=args.img_size, stride=args.crop_stride)
             processed_crops = []
             processed_mattes = []
-            # 각 crop patch에 ViT 적용
             for crop in crops:
                 sub_data, positions = split_image_overlap(crop, crop_size=256, overlap_size=args.overlap_size)
-                matte_patches = []
+                matte_patches_input = []
                 for sub in sub_data:
                     with torch.no_grad():
                         matte_patch = matte_predictor.predict_from_tensor(sub)
-                    matte_patches.append(matte_patch)
-                processed = process_split_image_with_shadow_matte(sub_data, matte_patches, net)
-                crop_processed = merge_image_overlap(processed, positions, crop_size=256, resolution=crop.shape, overlap_size=args.overlap_size, blend_mode='gaussian')
-                crop_mattes = merge_image_overlap(matte_patches, positions, crop_size=256, resolution=(args.BATCH_SIZE, 1, args.img_size, args.img_size), overlap_size=args.overlap_size, blend_mode='gaussian')
+                    matte_patches_input.append(matte_patch)
+                processed = process_split_image_with_shadow_matte(sub_data, matte_patches_input, net)
+                matte_from_processed = []
+                for proc_patch in processed:
+                    with torch.no_grad():
+                        matte_patch = matte_predictor.predict_from_tensor(proc_patch)
+                    matte_from_processed.append(matte_patch)
+                crop_processed = merge_image_overlap(processed, positions, crop_size=256,
+                                                     resolution=crop.shape, overlap_size=args.overlap_size,
+                                                     blend_mode='gaussian')
+                crop_mattes = merge_image_overlap(matte_from_processed, positions, crop_size=256,
+                                                  resolution=(args.BATCH_SIZE, 1, args.img_size, args.img_size),
+                                                  overlap_size=args.overlap_size, blend_mode='gaussian')
                 processed_crops.append(crop_processed)
                 processed_mattes.append(crop_mattes)
             outputs = merge_sliding_crops(processed_crops, crop_positions, original_width=W, overlap_size=args.overlap_size)
@@ -305,14 +313,23 @@ def inference(net, net_1, infer_loader, save_dir):
             processed_mattes = []
             for crop in crops:
                 sub_data, positions = split_image_overlap(crop, crop_size=256, overlap_size=args.overlap_size)
-                matte_patches = []
+                matte_patches_input = []
                 for sub in sub_data:
                     with torch.no_grad():
                         matte_patch = matte_predictor.predict_from_tensor(sub)
-                    matte_patches.append(matte_patch)
-                processed = process_split_image_with_shadow_matte(sub_data, matte_patches, net)
-                crop_processed = merge_image_overlap(processed, positions, crop_size=256, resolution=crop.shape, overlap_size=args.overlap_size, blend_mode='gaussian')
-                crop_mattes = merge_image_overlap(matte_patches, positions, crop_size=256, resolution=(args.BATCH_SIZE, 1, args.img_size, args.img_size), overlap_size=args.overlap_size, blend_mode='gaussian')
+                    matte_patches_input.append(matte_patch)
+                processed = process_split_image_with_shadow_matte(sub_data, matte_patches_input, net)
+                matte_from_processed = []
+                for proc_patch in processed:
+                    with torch.no_grad():
+                        matte_patch = matte_predictor.predict_from_tensor(proc_patch)
+                    matte_from_processed.append(matte_patch)
+                crop_processed = merge_image_overlap(processed, positions, crop_size=256,
+                                                     resolution=crop.shape, overlap_size=args.overlap_size,
+                                                     blend_mode='gaussian')
+                crop_mattes = merge_image_overlap(matte_from_processed, positions, crop_size=256,
+                                                  resolution=(args.BATCH_SIZE, 1, args.img_size, args.img_size),
+                                                  overlap_size=args.overlap_size, blend_mode='gaussian')
                 processed_crops.append(crop_processed)
                 processed_mattes.append(crop_mattes)
             outputs = merge_sliding_crops(processed_crops, crop_positions, original_width=W, overlap_size=args.overlap_size)
@@ -334,14 +351,14 @@ if __name__ == '__main__':
     wandb.init(project="nafnet_wloss", name=args.experiment_name, config=vars(args))
     if args.Flag_multi_scale:
         net_1 = NAFNet_CBAM(img_channel=args.img_channel, width=args.base_channel, middle_blk_num=args.num_res,
-                       enc_blk_nums=args.enc_blks, dec_blk_nums=args.dec_blks, global_residual=False)
+                            enc_blk_nums=args.enc_blks, dec_blk_nums=args.dec_blks, global_residual=False)
     else:
         net_1 = NAFNet_CBAM(img_channel=args.img_channel, width=args.base_channel, middle_blk_num=args.num_res,
-                       enc_blk_nums=args.enc_blks, dec_blk_nums=args.dec_blks, global_residual=False)
+                            enc_blk_nums=args.enc_blks, dec_blk_nums=args.dec_blks, global_residual=False)
     net = MaskedAutoencoderViT(patch_size=args.vit_patch_size, embed_dim=args.vit_embed_dim, depth=args.vit_depth,
-                              num_heads=args.vit_num_heads, decoder_embed_dim=args.vit_decoder_embed_dim,
-                              decoder_depth=args.vit_decoder_depth, decoder_num_heads=args.vit_decoder_num_heads,
-                              mlp_ratio=args.vit_mlp_ratio, norm_layer=partial(nn.LayerNorm, eps=1e-6))
+                               num_heads=args.vit_num_heads, decoder_embed_dim=args.vit_decoder_embed_dim,
+                               decoder_depth=args.vit_decoder_depth, decoder_num_heads=args.vit_decoder_num_heads,
+                               mlp_ratio=args.vit_mlp_ratio, norm_layer=partial(nn.LayerNorm, eps=1e-6))
     matte_predictor = ShadowMattePredictor(
         model_path=args.shadow_matte_path,
         img_size=args.vit_img_size,
@@ -362,10 +379,8 @@ if __name__ == '__main__':
     print_param_number(net_1)
     wandb.watch(net_1, log="all")
 
-    optimizer_vit = optim.Adam(net.parameters(), lr=args.vit_learning_rate, betas=(0.9, 0.999))
-    optimizer_nafnet = optim.Adam(net_1.parameters(), lr=args.nafnet_learning_rate, betas=(0.9, 0.999))
-    scheduler_vit = CosineAnnealingWarmRestarts(optimizer=optimizer_vit, T_0=args.T_period, T_mult=1)
-    scheduler_nafnet = CosineAnnealingWarmRestarts(optimizer=optimizer_nafnet, T_0=args.T_period, T_mult=1)
+    optimizerG = optim.Adam(list(net.parameters()) + list(net_1.parameters()), lr=args.learning_rate, betas=(0.9, 0.999))
+    scheduler = CosineAnnealingWarmRestarts(optimizer=optimizerG, T_0=args.T_period, T_mult=1)
 
     base_loss = weighted_charbonnier_loss if args.base_loss.lower() == 'weightedchar' else nn.L1Loss()
     if args.addition_loss.lower() == 'vgg':
@@ -384,9 +399,8 @@ if __name__ == '__main__':
                 print(f" train_input.size: {data_in.size()}, gt.size: {label.size()}")
             running_results['iter_nums'] += 1
             net_1.train()
-            net.train()  # Ensure ViT is in train mode too.
-            optimizer_vit.zero_grad()
-            optimizer_nafnet.zero_grad()
+            net.train()
+            optimizerG.zero_grad()
 
             inputs = data_in.to(device)
             labels = label.to(device)
@@ -395,18 +409,27 @@ if __name__ == '__main__':
             processed_mattes = []
             for crop in crops:
                 sub_data, positions = split_image_overlap(crop, crop_size=256, overlap_size=args.overlap_size)
-                matte_patches = []
+                matte_patches_input = []
                 for sub in sub_data:
                     with torch.no_grad():
                         matte_patch = matte_predictor.predict_from_tensor(sub)
-                    matte_patches.append(matte_patch)
-                processed = process_split_image_with_shadow_matte(sub_data, matte_patches, net)
-                crop_processed = merge_image_overlap(processed, positions, crop_size=256, resolution=crop.shape, overlap_size=args.overlap_size, blend_mode='gaussian')
-                crop_mattes = merge_image_overlap(matte_patches, positions, crop_size=256, resolution=(args.BATCH_SIZE, 1, args.img_size, args.img_size), overlap_size=args.overlap_size, blend_mode='gaussian')
+                    matte_patches_input.append(matte_patch)
+                processed = process_split_image_with_shadow_matte(sub_data, matte_patches_input, net)
+                matte_from_processed = []
+                for proc_patch in processed:
+                    with torch.no_grad():
+                        matte_patch = matte_predictor.predict_from_tensor(proc_patch)
+                    matte_from_processed.append(matte_patch)
+                crop_processed = merge_image_overlap(processed, positions, crop_size=256,
+                                                     resolution=crop.shape, overlap_size=args.overlap_size, blend_mode='gaussian')
+                crop_mattes = merge_image_overlap(matte_from_processed, positions, crop_size=256,
+                                                  resolution=(args.BATCH_SIZE, 1, args.img_size, args.img_size),
+                                                  overlap_size=args.overlap_size, blend_mode='gaussian')
                 processed_crops.append(crop_processed)
                 processed_mattes.append(crop_mattes)
             outputs = merge_sliding_crops(processed_crops, crop_positions, original_width=inputs.shape[-1], overlap_size=args.overlap_size)
             mattes = merge_sliding_crops(processed_mattes, crop_positions, original_width=inputs.shape[-1], overlap_size=args.overlap_size)
+            
             nafnet_output = net_1(outputs, mattes)
             loss1 = base_loss(nafnet_output, labels, args.weight_coff)
             fft_loss = losses.fftLoss()(nafnet_output, labels)
@@ -415,32 +438,21 @@ if __name__ == '__main__':
             loss_total = loss_total + loss_addition
             Avg_Meters_training.update({'total_loss': loss_total.item()})
             loss_total.backward()
-            optimizer_vit.step()
-            optimizer_nafnet.step()
+            optimizerG.step()
             global_iter += 1
-
-            if global_iter % 5000 == 0:
-                checkpoint_path = os.path.join(SAVE_PATH, f"vit_{global_iter}.pth")
-                checkpoint_path1 = os.path.join(SAVE_PATH, f"nafnet_{global_iter}.pth")
-                torch.save(net.state_dict(), checkpoint_path)
-                torch.save(net_1.state_dict(), checkpoint_path1)
-                print(f"Checkpoint saved at iteration {global_iter}")
-                logging.info(f"Checkpoint saved at iteration {global_iter}")
             
             if (i + 1) % args.print_frequency == 0 and i > 1:
                 psnr_val = compute_psnr(nafnet_output, labels)
                 ssim_val = compute_ssim(nafnet_output, labels)
-                print("Iteration:%d, [vit_lr: %.7f], [nafnet_lr: %.7f], [loss_total: %.5f], PSNR: %.2f, SSIM: %.4f" %
-                        (global_iter, optimizer_vit.param_groups[0]["lr"], optimizer_nafnet.param_groups[0]["lr"], loss_total.item(), psnr_val, ssim_val))
+                print("Iteration:%d, [lr: %.7f], [loss_total: %.5f], PSNR: %.2f, SSIM: %.4f" %
+                      (global_iter, optimizerG.param_groups[0]["lr"], loss_total.item(), psnr_val, ssim_val))
                 wandb.log({
                     "iteration": global_iter,
                     "loss_total": loss_total.item(),
                     "loss_char": loss1.item(),
                     "loss_fft": fft_loss.item(),
                     "iter_psnr": psnr_val,
-                    "iter_ssim": ssim_val,
-                    "vit_lr": optimizer_vit.param_groups[0]["lr"],
-                    "nafnet_lr": optimizer_nafnet.param_groups[0]["lr"]
+                    "iter_ssim": ssim_val
                 })
             if global_iter % 5000 == 0:
                 val_psnr, val_ssim = validate(net, net_1, val_loader, VAL_SAVE_DIR, global_iter)
@@ -452,8 +464,7 @@ if __name__ == '__main__':
                 })
             if global_iter >= args.iteration_target:
                 break
-        scheduler_vit.step()
-        scheduler_nafnet.step()
+        scheduler.step()
     torch.save(net.state_dict(), os.path.join(SAVE_PATH, "train_vit_wmatte"))
     torch.save(net_1.state_dict(), os.path.join(SAVE_PATH, "train_nafnet_wmatte"))
     print("Training complete: NAFNet model (finetuned) saved.")

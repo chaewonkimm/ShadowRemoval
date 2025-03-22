@@ -54,7 +54,7 @@ class SpatialAttention(nn.Module):
         x_out = self.conv(x_out)
         
         if shadow_matte is not None:
-            shadow_weight_factor = 0.5
+            shadow_weight_factor = 1.0
             B, C, H, W = x.shape
 
             if shadow_matte.shape[2:] != (H, W):

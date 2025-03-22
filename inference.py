@@ -1,4 +1,3 @@
-# inference.py
 import os
 import time
 import sys
@@ -6,33 +5,125 @@ import argparse
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
+import torchvision
+from torch.utils.data import DataLoader, Dataset
 from functools import partial
-from torchvision.transforms import ToPILImage
 from torchvision import transforms
+from PIL import Image
+import wandb
+import torchvision.utils as vutils
 from networks.MaeVit_arch import MaskedAutoencoderViT
-from networks.Split_images import split_image, merge_parallel, process_split_image_with_model_parallel
-from datasets.datasets_pairs import my_dataset_eval
+from networks.NAFNet_arch import NAFNet_CBAM
+from networks.shadow_matte import ShadowMattePredictor
+from networks.Split_images import process_split_image_with_shadow_matte
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def split_image_overlap(img, crop_size, overlap_size):
+    B, C, H, W = img.shape
+    stride = crop_size - overlap_size
+    y_starts = list(range(0, H - crop_size + 1, stride))
+    if y_starts and y_starts[-1] != H - crop_size:
+        y_starts.append(H - crop_size)
+    x_starts = list(range(0, W - crop_size + 1, stride))
+    if x_starts and x_starts[-1] != W - crop_size:
+        x_starts.append(W - crop_size)
+    patches = []
+    positions = []
+    for y in y_starts:
+        for x in x_starts:
+            patch = img[:, :, y:y+crop_size, x:x+crop_size]
+            patches.append(patch)
+            positions.append((y, x, crop_size, crop_size))
+    return patches, positions
+
+def create_gaussian_mask(patch_size, overlap):
+    h, w = patch_size
+    weight_y = torch.ones(h, dtype=torch.float32)
+    sigma = overlap / 2.0 if overlap > 0 else 1.0
+    for i in range(h):
+        if i < overlap:
+            weight_y[i] = math.exp(-0.5 * ((overlap - i)/sigma)**2)
+        elif i > h - overlap - 1:
+            weight_y[i] = math.exp(-0.5 * ((i - (h - overlap - 1))/sigma)**2)
+    weight_x = torch.ones(w, dtype=torch.float32)
+    for j in range(w):
+        if j < overlap:
+            weight_x[j] = math.exp(-0.5 * ((overlap - j)/sigma)**2)
+        elif j > w - overlap - 1:
+            weight_x[j] = math.exp(-0.5 * ((j - (w - overlap - 1))/sigma)**2)
+    mask = torch.ger(weight_y, weight_x)
+    return mask.unsqueeze(0).unsqueeze(0)
+
+def merge_image_overlap(patches, positions, crop_size, resolution, overlap_size, blend_mode='gaussian'):
+    B, C, H, W = resolution
+    device = patches[0].device
+    merged = torch.zeros((B, C, H, W), device=device)
+    weight_sum = torch.zeros((B, 1, H, W), device=device)
+    for patch, pos in zip(patches, positions):
+        y, x, ph, pw = pos
+        if blend_mode == 'gaussian' and overlap_size > 0:
+            mask = create_gaussian_mask((ph, pw), overlap_size).to(device)
+        else:
+            mask = torch.ones((1, 1, ph, pw), device=device)
+        merged[:, :, y:y+ph, x:x+pw] += patch * mask
+        weight_sum[:, :, y:y+ph, x:x+pw] += mask
+    merged = merged / (weight_sum + 1e-8)
+    return merged
+
+def sliding_crop_left(img, patch_size, stride):
+    B, C, H, W = img.shape
+    patches = []
+    positions = []
+    for x in range(0, W - patch_size + 1, stride):
+        patch = img[:, :, 0:H, x:x+patch_size]
+        patches.append(patch)
+        positions.append((0, x, patch_size, H))
+    return patches, positions
+
+def merge_sliding_crops(crops, crop_positions, original_width, overlap_size):
+    B, C, H, W_crop = crops[0].shape
+    device = crops[0].device
+    merged = torch.zeros((B, C, H, original_width), device=device)
+    weight = torch.zeros((B, 1, H, original_width), device=device)
+    for crop, pos in zip(crops, crop_positions):
+        x = pos[1]
+        merged[:, :, :, x:x+W_crop] += crop
+        weight[:, :, :, x:x+W_crop] += 1.0
+    merged = merged / (weight + 1e-8)
+    return merged
+
+class InferenceDataset(Dataset):
+    def __init__(self, dir_path, transform=None):
+        self.dir_path = dir_path
+        self.image_names = sorted(os.listdir(dir_path))
+        self.transform = transform if transform is not None else transforms.Compose([transforms.ToTensor()])
+    def __len__(self):
+        return len(self.image_names)
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.dir_path, self.image_names[idx])
+        img = Image.open(img_path).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, self.image_names[idx]
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Inference: Remove shadows from input images and save outputs")
-    parser.add_argument("--checkpoint", type=str, default='../autodl-tmp/SR_1/train_shadow_nafnet/nafnet_stage2_wloss.pth')
-    #parser.add_argument("--checkpoint", type=str, default='./checkpoints/train_vit_stage1_wloss_total/vit_stage1_wloss.pth')
-    parser.add_argument("--input_dir", type=str, default='../validation/')
-    parser.add_argument("--output_dir", type=str, default='./outputs4')
+    parser = argparse.ArgumentParser(description="Inference: ViT+NAFNet pipeline with matte predictor and sliding crop")
+    parser.add_argument("--checkpoint", type=str, default="./files/nafnet.pth")
+    parser.add_argument("--vit_checkpoint", type=str, default="./files/vit.pth")
+    parser.add_argument("--matte_generator_checkpoint", type=str, default="./files/shadow_matte_generator.pth")
+    parser.add_argument("--input_dir", type=str, default="./test/")
+    parser.add_argument("--output_dir", type=str, default="./outputs")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--img_size", type=int, default=256)
-    parser.add_argument("--grid_type", type=str, default="4x4")
+    parser.add_argument("--nafn_patch_size", type=int, default=256)
+    parser.add_argument("--overlap_size", type=int, default=128)
+    parser.add_argument("--crop_stride", type=int, default=250)
+    parser.add_argument("--img_size", type=int, default=1000)
     args = parser.parse_args()
     return args
 
 def main():
     args = parse_args()
-    print("Evaluation arguments:")
-    print(args)
     os.makedirs(args.output_dir, exist_ok=True)
     
     net = MaskedAutoencoderViT(
@@ -40,74 +131,75 @@ def main():
         decoder_embed_dim=256, decoder_depth=6, decoder_num_heads=8,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6)
     )
+    net_1 = NAFNet_CBAM(
+        img_channel=3, width=32, middle_blk_num=24,
+        enc_blk_nums=[1, 1, 1, 28], dec_blk_nums=[1, 1, 1, 1], global_residual=False
+    )
     net.to(device)
+    net_1.to(device)
     net.eval()
-    if not os.path.exists(args.checkpoint):
-        print(f"[Error] Checkpoint not found: {args.checkpoint}")
+    net_1.eval()
+    
+    if not os.path.exists(args.vit_checkpoint):
+        print(f"[Error] ViT checkpoint not found: {args.vit_checkpoint}")
         sys.exit(1)
-    net.load_state_dict(torch.load(args.checkpoint, map_location=device))
-    print(f"Loaded checkpoint from {args.checkpoint}")
+    net.load_state_dict(torch.load(args.vit_checkpoint, map_location=device))
+    print(f"Loaded ViT checkpoint from {args.vit_checkpoint}")
     
-    transform = transforms.ToTensor()
-    dataset = my_dataset_eval(args.input_dir, args.input_dir, transform=transform)
+    if not os.path.exists(args.checkpoint):
+        print(f"[Error] NAFNet checkpoint not found: {args.checkpoint}")
+        sys.exit(1)
+    net_1.load_state_dict(torch.load(args.checkpoint, map_location=device))
+    print(f"Loaded NAFNet checkpoint from {args.checkpoint}")
+    
+    dataset = InferenceDataset(args.input_dir)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-    to_pil = ToPILImage()
-
-    s_time = time.time()
     
+    s_time = time.time()
     with torch.no_grad():
-        for data in loader:
-            if isinstance(data, (list, tuple)):
-                if len(data) == 2:
-                    inputs, file_names = data
-                elif len(data) >= 3:
-                    inputs, _, file_names = data[:3]
-                else:
-                    inputs = data
-                    file_names = ["unknown"] * inputs.size(0)
-            else:
-                inputs = data
-                file_names = ["unknown"] * inputs.size(0)
-            inputs = inputs.to(device)
+        for data, fname in loader:
+            inputs = data.to(device)
+            B, C, H, W = inputs.shape
             
-            orig_H, orig_W = inputs.shape[2], inputs.shape[3]
-            print("Original input image size:", inputs.shape)
+            crops, crop_positions = sliding_crop_left(inputs, patch_size=args.img_size, stride=args.crop_stride)
+            processed_crops = []
+            processed_mattes = []
             
-            grid_rows, grid_cols = [int(x) for x in args.grid_type.split('x')]
+            for crop in crops:
+                sub_data, positions = split_image_overlap(crop, crop_size=args.nafn_patch_size, overlap_size=args.overlap_size)
+                matte_patches_input = []
+                for sub in sub_data:
+                    matte_patch = matte_predictor.predict_from_tensor(sub)
+                    matte_patches_input.append(matte_patch)
+                processed = process_split_image_with_shadow_matte(sub_data, matte_patches_input, net)
+                matte_from_processed = []
+                for proc_patch in processed:
+                    matte_patch = matte_predictor.predict_from_tensor(proc_patch)
+                    matte_from_processed.append(matte_patch)
+                crop_processed = merge_image_overlap(processed, positions, crop_size=args.nafn_patch_size,
+                                                     resolution=crop.shape, overlap_size=args.overlap_size, blend_mode='gaussian')
+                crop_mattes = merge_image_overlap(matte_from_processed, positions, crop_size=args.nafn_patch_size,
+                                                  resolution=(B, 1, crop.shape[2], crop.shape[3]), overlap_size=args.overlap_size, blend_mode='gaussian')
+                processed_crops.append(crop_processed)
+                processed_mattes.append(crop_mattes)
             
-            target_H = math.ceil(orig_H / 8) * 8
-            target_W = math.ceil(orig_W / 8) * 8
+            outputs = merge_sliding_crops(processed_crops, crop_positions, original_width=W, overlap_size=args.overlap_size)
+            mattes = merge_sliding_crops(processed_mattes, crop_positions, original_width=W, overlap_size=args.overlap_size)
             
-            target_H = math.ceil(target_H / grid_rows) * grid_rows
-            target_W = math.ceil(target_W / grid_cols) * grid_cols
-
-            pad_bottom = target_H - orig_H
-            pad_right = target_W - orig_W
-            inputs_padded = F.pad(inputs, (0, pad_right, 0, pad_bottom), mode='reflect')
-            print("Padded image size:", inputs_padded.shape)
+            nafnet_output = net_1(outputs)
+            nafnet_output = torch.clamp(nafnet_output, 0, 1)
             
-            sub_images, positions = split_image(inputs_padded, args.grid_type)
-            sub_H = inputs_padded.shape[2] // grid_rows
-            sub_W = inputs_padded.shape[3] // grid_cols
-            print(f"[DEBUG] Calculated sub-image size: {sub_H}x{sub_W}")
-            
-            processed_sub_images = process_split_image_with_model_parallel(sub_images, net)
-
-            outputs_padded = merge_parallel(processed_sub_images, args.grid_type)
-            
-            outputs = F.interpolate(outputs_padded, size=(orig_H, orig_W), mode='bilinear', align_corners=False)
-            
-            for i in range(outputs.size(0)):
-                output_tensor = outputs[i].cpu()
-                output_tensor = torch.clamp(output_tensor, 0, 1)
-                output_img = to_pil(output_tensor)
-                save_path = os.path.join(args.output_dir, file_names[i])
-                output_img.save(save_path)
-                print(f"Saved output image: {save_path}")
-
+            for i in range(nafnet_output.size(0)):
+                out_path = os.path.join(args.output_dir, fname[i])
+                torchvision.utils.save_image(nafnet_output[i].cpu(), out_path, normalize=True)
+                print(f"Saved output image: {out_path}")
     e_time = time.time()
-    f_time = e_time - s_time
-    print(f"Elapsed time: {f_time} seconds")
+    print(f"Elapsed time: {e_time - s_time} seconds")
 
 if __name__ == "__main__":
+    matte_predictor = ShadowMattePredictor(
+        model_path=args.matte_generator_checkpoint,
+        img_size=256,
+        device=device
+    )
     main()
